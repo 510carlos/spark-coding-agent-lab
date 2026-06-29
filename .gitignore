@@ -1,0 +1,15 @@
+# model weights are fetched, never committed
+*.gguf
+*.safetensors
+models/weights/
+# python / venv
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+bench/demo-repo/todos.json
+# per-run transcripts (keep RUN-LOG.md, drop the raw dumps)
+results/runs/
+
+# internal session log — never ship
+results/RUN-LOG.reference.md

@@ -1,0 +1,77 @@
+name: spark-coding-agent-lab
+
+# Engines are gated behind PROFILES so only the one you pick starts.
+# All carry the spark-coding-agent-lab=1 label so `free-gpu` knows it may stop them.
+# GPU via deploy.devices (broadly supported); bench-client talks to engines by
+# service name over the default network.
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+  labels: ["spark-coding-agent-lab=1"]
+
+services:
+  ds4:
+    <<: *gpu
+    profiles: ["ds4"]
+    build: ./engines/ds4
+    image: ghcr.io/exxact/spark-coding-agent-lab-ds4:latest   # pre-built; falls back to build
+    command: ["-m", "/models/deepseek-v4-flash.gguf"]
+    volumes: ["./models/weights:/models:ro"]
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/models"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  vllm:
+    <<: *gpu
+    profiles: ["vllm"]
+    image: ghcr.io/bjk110/vllm-spark:v022-d568-ngc2605-tx5102-vllm022
+    command: >
+      vllm serve /models/m --served-model-name gemma-26b
+      --max-model-len 65536 --gpu-memory-utilization 0.55 --trust-remote-code
+      --host 0.0.0.0 --port 8000 --enforce-eager
+      --enable-auto-tool-choice --tool-call-parser gemma4
+    volumes: ["./models/weights:/models:ro"]
+    ports: ["8000:8000"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/models"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 60s
+
+  ollama:
+    <<: *gpu
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    environment: ["OLLAMA_HOST=0.0.0.0:11434", "OLLAMA_MAX_LOADED_MODELS=1"]
+    volumes: ["${OLLAMA_DIR:-ollama}:/root/.ollama"]   # set OLLAMA_DIR=~/.ollama to reuse host-pulled models
+    ports: ["11434:11434"]
+    healthcheck:
+      test: ["CMD", "ollama", "ls"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+
+  # bench-client: holds uv, pytest, tmux, and all 4 harness CLIs. Run via:
+  #   docker compose run --rm -e ENGINE=… -e HARNESS=… -e MODEL=… bench
+  bench:
+    profiles: ["bench"]
+    build:
+      context: .
+      dockerfile: bench-client/Dockerfile
+    image: ghcr.io/exxact/spark-coding-agent-lab-bench:latest
+    environment: ["ENGINE", "HARNESS", "MODEL", "TASK"]
+    volumes:
+      - "./results:/lab/results"   # only results are mounted; bench+harnesses baked in
+    # engines reachable by service name: http://ds4:8080, http://vllm:8000, http://ollama:11434
+
+volumes:
+  ollama:

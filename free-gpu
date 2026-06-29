@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# free-gpu — reclaim the GPU/unified memory before launching an engine.
+#
+# On a 128 GB unified-memory Spark, two large models can't co-reside, and the
+# wrong kill takes down your desktop/SSH. So this is conservative:
+#   detect (nvidia-smi compute-apps, NOT ps-rss) → classify → reclaim ours →
+#   abort on foreign/unknown unless --evict → gate on free memory.
+#
+# Usage: free-gpu [--need GB] [--evict] [--restore-after] [--keep ENGINE]
+#   --need GB        require this much *available* memory after reclaim (default 90)
+#   --evict          allow stopping FOREIGN engines (yours), not just lab-managed
+#   --restore-after  record evicted foreign containers to restore later (make restore)
+#   --keep ENGINE    don't touch this lab engine service (the one we're about to use)
+set -uo pipefail
+
+NEED=90; EVICT=0; RESTORE=0; KEEP=""
+while [[ $# -gt 0 ]]; do case "$1" in
+  --need) NEED="$2"; shift 2;; --evict) EVICT=1; shift;;
+  --restore-after) RESTORE=1; shift;; --keep) KEEP="$2"; shift 2;;
+  *) echo "unknown arg: $1"; exit 2;; esac; done
+
+PROTECT='Xorg|gnome-shell|sshd|systemd|dockerd|containerd|bash|zsh|node|claude'
+STATE=/tmp/spark-coding-agent-lab.evicted; : > "$STATE"
+log(){ echo "[free-gpu] $*"; }
+
+# pid -> docker container id (via cgroup), empty if not containerized
+pid_container(){ grep -ho 'docker[-/][0-9a-f]\{64\}' "/proc/$1/cgroup" 2>/dev/null \
+                 | grep -o '[0-9a-f]\{64\}' | head -1; }
+avail_gb(){ free -g | awk '/^Mem:/{print $7}'; }
+
+log "detecting GPU holders (nvidia-smi compute-apps; RSS is unreliable on unified memory)…"
+HOLDERS=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+          --format=csv,noheader,nounits 2>/dev/null)
+
+ABORT=0
+while IFS=',' read -r pid name mib; do
+  pid="${pid// /}"; mib="${mib// /}"; name="$(echo "$name" | xargs)"
+  [[ -z "$pid" ]] && continue
+  (( mib < 2000 )) && continue                      # ignore small/graphics users
+  cid="$(pid_container "$pid")"; short="${cid:0:12}"
+
+  # protected host process holding real memory? warn, don't touch.
+  if [[ -z "$cid" ]] && echo "$name" | grep -qE "$PROTECT"; then
+    log "  protected: $name (pid $pid, ${mib} MiB) — leaving it"; continue; fi
+
+  if [[ -n "$cid" ]]; then
+    cname="$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's#^/##')"
+    managed="$(docker inspect -f '{{ index .Config.Labels "spark-coding-agent-lab"}}' "$cid" 2>/dev/null)"
+    if [[ "$cname" == "$KEEP" ]]; then continue; fi
+    if [[ "$managed" == "1" ]]; then
+      log "  lab-managed container $cname (${mib} MiB) → stopping"
+      docker stop "$cname" >/dev/null 2>&1
+    elif [[ "$EVICT" == 1 ]]; then
+      log "  EVICT foreign container $cname (${mib} MiB) → stopping"
+      [[ "$RESTORE" == 1 ]] && echo "container $cname" >> "$STATE"
+      docker stop "$cname" >/dev/null 2>&1
+    else
+      log "  ⚠ FOREIGN container '$cname' holds ${mib} MiB on the GPU."
+      log "    re-run with --evict (add --restore-after to bring it back)."; ABORT=1
+    fi
+  else
+    # host process, not protected, not a container — could be a native ds4-server
+    if echo "$name" | grep -q 'ds4-server'; then
+      log "  ds4-server (pid $pid, ${mib} MiB) → SIGTERM"; kill -TERM "$pid" 2>/dev/null
+    elif [[ "$EVICT" == 1 ]]; then
+      log "  EVICT host process $name (pid $pid, ${mib} MiB)"; kill -TERM "$pid" 2>/dev/null
+    else
+      log "  ⚠ FOREIGN process '$name' (pid $pid) holds ${mib} MiB. re-run with --evict."; ABORT=1
+    fi
+  fi
+done <<< "$HOLDERS"
+
+# also unload any Ollama-resident model (frees unified RAM) unless we're keeping ollama
+if [[ "$KEEP" != "ollama" ]]; then
+  for m in $(ollama ps 2>/dev/null | awk 'NR>1{print $1}'); do
+    log "  ollama: unloading $m"; ollama stop "$m" >/dev/null 2>&1; done
+fi
+
+(( ABORT == 1 )) && { log "aborting — foreign GPU user(s) present and --evict not set."; exit 3; }
+
+# gate: wait for enough free memory
+log "waiting for ≥ ${NEED} GB available…"
+for i in $(seq 1 40); do a=$(avail_gb); (( a >= NEED )) && { log "ok: ${a} GB available."; exit 0; }; sleep 3; done
+log "timeout: only $(avail_gb) GB available (< ${NEED}). Something is still holding memory."; exit 4
